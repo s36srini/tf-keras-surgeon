@@ -254,7 +254,10 @@ class Surgeon:
                         output = new_layer(utils.single_element(list(inputs)))
                 else:
                     new_layer, output_mask = self._apply_delete_mask(node, input_masks)
+                    #print("Single element list: ", utils.single_element(list(inputs)))
                     output = new_layer(utils.single_element(list(inputs)))
+                    #print("New Layer", new_layer)
+                    print("New Layer constructor:", output)
 
                 # Record that this node has been rebuild
                 self._finished_nodes[node] = (output, output_mask)
@@ -380,6 +383,7 @@ class Surgeon:
         inbound_masks = utils.single_element(inbound_masks)
         # otherwise, delete_mask.shape should be: layer.input_shape[1:]
         layer_class = layer.__class__.__name__
+        print(layer_class)
         if layer_class == 'InputLayer':
             raise RuntimeError('This should never get here!')
 
@@ -404,8 +408,11 @@ class Surgeon:
             else:
                 if data_format == 'channels_first':
                     inbound_masks = np.swapaxes(inbound_masks, 0, -1)
+
+                
                 # Conv layer: trim down inbound_masks to filter shape
                 k_size = layer.kernel_size
+
                 index = [slice(None, 1, None) for _ in k_size]
                 inbound_masks = inbound_masks[tuple(index + [slice(None)])]
                 weights = layer.get_weights()
@@ -418,11 +425,43 @@ class Surgeon:
                 new_shape = list(weights[0].shape)
                 new_shape[-2] = -1  # Weights always have channels_last
                 weights[0] = np.reshape(weights[0][delete_mask], new_shape)
+
                 # Instantiate new layer with new_weights
                 config = layer.get_config()
                 config['weights'] = weights
                 new_layer = type(layer).from_config(config)
             outbound_mask = None
+
+        elif layer_class == 'DepthwiseConv2D':
+            if np.all(inbound_masks):
+                new_layer = layer
+            else:
+                if data_format == 'channels_first':
+                    print("channels first")
+                    inbound_masks = np.swapaxes(inbound_masks, 0, -1)
+
+               # Instantiate new layer with new_weights
+                my_mask = np.swapaxes(inbound_masks, 0, -1)
+
+                channel_indices = []
+                for i in range(my_mask.shape[0]):
+                    if np.where(my_mask[i] == False)[0].size != 0:
+                        channel_indices.append(i)
+
+                weights = [np.delete(layer.get_weights()[0], channel_indices, axis=-2)]
+
+                # Check if the Convolution contains a bias add, if it does we need to slice it based on the channel indices
+                if len(layer.get_weights()) == 2:
+                    print("Depthwise contains bias add")
+                    weights.append([np.delete(layer.get_weights()[1], channel_indices, axis=-1)])
+                    
+                config = layer.get_config()
+                config['weights'] = weights
+                new_layer = type(layer).from_config(config)
+                output_shape = layer.output_shape[1:]
+
+                outbound_mask = inbound_masks[:output_shape[0], :output_shape[1], :]
+                
 
         elif layer_class in ('Cropping1D', 'Cropping2D', 'Cropping3D',
                              'MaxPooling1D', 'MaxPooling2D',
@@ -447,7 +486,7 @@ class Surgeon:
                              'ZeroPadding3D'):
 
             # Get slice of mask with all singleton dimensions except
-            # channels dimension
+            # channels dimensijn
             index = [slice(1)] * (len(input_shape) - 1)
             tile_shape = list(output_shape[1:])
             if data_format == 'channels_first':
@@ -458,9 +497,11 @@ class Surgeon:
                 tile_shape[-1] = 1
             else:
                 raise ValueError('Invalid data format')
+            print("Inbound Mask", inbound_masks.shape)
             channels_vector = inbound_masks[tuple(index)]
             # Tile this slice to create the outbound mask
             outbound_mask = np.tile(channels_vector, tile_shape)
+            print("Outbound Mask", outbound_mask.shape)
             new_layer = layer
 
         elif layer_class in ('GlobalMaxPooling1D',
@@ -479,17 +520,19 @@ class Surgeon:
             channels_vector = inbound_masks[tuple(index)]
             # Tile this slice to create the outbound mask
             outbound_mask = channels_vector
+            print("GlobalAvgPooling Outbound Mask", outbound_mask.shape)
             new_layer = layer
 
         elif layer_class in ('Dropout',
                              'Activation',
+                             'Softmax',
                              'SpatialDropout1D',
                              'SpatialDropout2D',
                              'SpatialDropout3D',
                              'ActivityRegularization',
                              'Masking',
                              'LeakyReLU',
-                             'ELU',
+                             'ReLU',
                              'ThresholdedReLU',
                              'GaussianNoise',
                              'GaussianDropout',
@@ -500,7 +543,12 @@ class Surgeon:
 
         elif layer_class == 'Reshape':
             outbound_mask = np.reshape(inbound_masks, layer.target_shape)
-            new_layer = layer
+            target_shape = list(outbound_mask.shape)
+            target_shape[-1] = outbound_mask[outbound_mask == True].shape[-1]
+
+            config = layer.get_config()
+            config['target_shape'] = target_shape
+            new_layer = type(layer).from_config(config) 
 
         elif layer_class == 'Permute':
             outbound_mask = np.transpose(inbound_masks,
@@ -558,16 +606,19 @@ class Surgeon:
             # Get slice of mask with all singleton dimensions except
             # channels dimension
             index = [0] * (len(input_shape))
-            index[layer.axis] = slice(None)
+            for i in (layer.axis._storage):
+                index[i] = slice(None)
             index = index[1:]
-            # TODO: Maybe use channel indices everywhere instead of masks?
+
             channel_indices = np.where(inbound_masks[tuple(index)] == False)[0]
             weights = [np.delete(w, channel_indices, axis=-1)
                        for w in layer.get_weights()]
             new_layer = BatchNormalization.from_config(
                 layer.get_config())
             new_input_shape = list(input_shape)
-            new_input_shape[new_layer.axis] -= len(channel_indices)
+            for i in (new_layer.axis._storage):
+             new_input_shape[i] -= len(channel_indices)
+
             new_layer.build(new_input_shape)
             new_layer.set_weights(weights)
 
@@ -583,11 +634,14 @@ class Surgeon:
             # - Dot
             # - PReLU
             # Warning/error needed for Reshape if channels axis is split
+            print(layer_class)
             raise ValueError('"{0}" layers are currently '
                              'unsupported.'.format(layer_class))
 
         if len(get_inbound_nodes(layer)) > 1 and new_layer != layer:
             self._replace_layers_map[layer] = (new_layer, outbound_mask)
+
+        print("New Layer", new_layer)
 
         return new_layer, outbound_mask
 
@@ -638,6 +692,9 @@ class Surgeon:
             weights = [np.delete(w, channel_indices_lstm, axis=-1)
                        for w in layer.get_weights()]
             weights[1] = np.delete(weights[1], channel_indices, axis=0)
+        elif layer.__class__.__name__ == 'DepthwiseConv2D':
+            weights = [np.delete(w, channel_indices, axis=-2)
+                       for w in layer.get_weights()]
         else:
             weights = [np.delete(w, channel_indices, axis=-1)
                        for w in layer.get_weights()]
